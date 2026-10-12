@@ -49,7 +49,7 @@ export async function readWithStreamDeadline<T>(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new AgentStreamTimeoutError(policy.timeoutMessage(Date.now()))), waitMs);
-    timer.unref?.();
+    // Keep the awaited read alive even when its source has no active I/O handles.
   });
   try {
     const chunk = await Promise.race([reader.read(), timeout]);
