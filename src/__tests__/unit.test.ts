@@ -670,7 +670,7 @@ describe('codex-provider', async () => {
     fs.mkdirSync(dir, { recursive: true });
     const rollout = path.join(dir, 'rollout-2026-08-12T01-02-03-thread-abc.jsonl');
     fs.writeFileSync(rollout, [
-      JSON.stringify({ type: 'session_meta', payload: { id: 'thread-abc', cwd: 'C:\\projects\\demo', git: { branch: 'main' } } }),
+      JSON.stringify({ type: 'session_meta', payload: { id: 'thread-abc', cwd: path.join(home, 'demo'), git: { branch: 'main' } } }),
       JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<recommended_plugins>\nInjected metadata\n</recommended_plugins>' }] } }),
       JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: '请始终用简体中文回复，除非用户明确要求其他语言。\n\n---\n\n帮我检查项目' } }),
       JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-5.6' } }),
