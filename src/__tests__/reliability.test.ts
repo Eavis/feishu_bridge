@@ -5,6 +5,8 @@ import { Client, defaultHttpInstance } from '@larksuiteoapi/node-sdk';
 import { createFeishuHttpClient } from '../feishu-http.js';
 import { getCommandHealth, hasActiveTasks, runBridgeLoop } from '../bridge.js';
 import { OutboxServer } from '../outbox-server.js';
+import { CodexProvider } from '../codex-provider.js';
+import { processMessage } from '../conversation.js';
 
 async function localApi(handler: http.RequestListener) {
   const server = http.createServer(handler);
@@ -151,4 +153,91 @@ test('failed command does not poison the next command in that chat', { timeout: 
   await runBridgeLoop(ctx);
   await until(() => getCommandHealth().pendingMessages === 0);
   assert.deepEqual(sent, ['1', '2']);
+});
+
+async function runCodexFixture(ending: 'completed' | 'failed' | 'silent' | 'exit') {
+  const script = `
+    process.stdin.resume();
+    process.stdin.on('end', () => {
+      const emit = event => process.stdout.write(JSON.stringify(event) + '\\n');
+      emit({ type: 'thread.started', thread_id: 'fixture-' + process.pid });
+      emit({ type: 'item.completed', item: { id: 'narration', type: 'agent_message', text: 'First step. ' } });
+      setTimeout(() => {
+        emit({ type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'Saved answer.' } });
+        const ending = ${JSON.stringify(ending)};
+        if (ending === 'failed') emit({ type: 'turn.failed', error: { message: 'Fixture upstream failure' } });
+        if (ending === 'completed' || ending === 'exit') {
+          const result = { type: 'turn.completed', usage: { input_tokens: 12, output_tokens: 4 } };
+          if (ending === 'exit') { process.stdout.write(JSON.stringify(result)); return; }
+          emit(result);
+        }
+        setInterval(() => {}, 1000);
+      }, 20);
+    });
+  `;
+  const provider = new CodexProvider(
+    { executable: process.execPath, prefixArgs: ['-e', script, '--'] },
+    { baseUrl: 'http://127.0.0.1:1', authEnvKey: 'PATH' }, 'fixture-model', [],
+  );
+  let released = false;
+  let threadId = '';
+  const saved: Array<{ role: string; content: string; usage?: string }> = [];
+  const ctx = {
+    config: { defaultAgent: 'codex', agentFirstEventTimeoutMs: 2000, agentIdleTimeoutMs: 250, agentMaxTurnTimeoutMs: 4000 },
+    providerFactory: () => provider,
+    store: {
+      acquireSessionLock: () => true, renewSessionLock() {}, getSession: () => ({}),
+      releaseSessionLock: () => { released = true; },
+      addMessage: (_id: string, role: string, content: string, usage?: string) => { saved.push({ role, content, usage }); },
+      updateSdkSessionId: (_id: string, id: string) => { threadId = id; }, updateSessionModel() {},
+    },
+  } as any;
+  const result = await processMessage(ctx, {
+    codepilotSessionId: 'fixture-session', agent: 'codex', mode: 'code', workingDirectory: process.cwd(),
+  } as any, 'Fixture only; no model or network access');
+  const pid = Number(threadId.replace('fixture-', ''));
+  assert.ok(Number.isInteger(pid) && pid > 0, 'fixture child must announce its PID');
+  // Both cancellation and completion must reap a child that keeps its pipes open.
+  const deadline = Date.now() + 6000;
+  let exited = false;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); } catch { exited = true; break; }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  if (!exited) { try { process.kill(pid); } catch { /* already gone */ } }
+  assert.ok(exited, 'finished fixture process must be cleaned up');
+  assert.ok(released, 'conversation session lock must be released');
+  return { result, saved, threadId };
+}
+
+test('Codex completion preserves the answer and usage even if the CLI never exits', { timeout: 10000 }, async () => {
+  const { result, saved, threadId } = await runCodexFixture('completed');
+  assert.equal(result.hasError, false, result.errorMessage);
+  assert.equal(result.responseText, 'First step. Saved answer.');
+  assert.equal(result.sdkSessionId, threadId);
+  assert.equal(result.tokenUsage?.output_tokens, 4);
+  assert.equal(saved.at(-1)?.content, result.responseText);
+  assert.equal(JSON.parse(saved.at(-1)!.usage!).output_tokens, 4);
+});
+
+test('Codex terminal failure keeps its original error even if the CLI never exits', { timeout: 10000 }, async () => {
+  const { result } = await runCodexFixture('failed');
+  assert.equal(result.hasError, true);
+  assert.equal(result.errorMessage, 'Fixture upstream failure');
+  assert.equal(result.responseText, 'First step. Saved answer.');
+});
+
+test('Codex completion accepts a final JSON line without a newline on natural exit', { timeout: 10000 }, async () => {
+  const { result } = await runCodexFixture('exit');
+  assert.equal(result.hasError, false, result.errorMessage);
+  assert.equal(result.responseText, 'First step. Saved answer.');
+  assert.equal(result.tokenUsage?.output_tokens, 4);
+});
+
+test('a genuinely silent Codex turn retains partial output when it times out', { timeout: 10000 }, async () => {
+  const { result, saved } = await runCodexFixture('silent');
+  assert.equal(result.hasError, true);
+  assert.match(result.errorMessage || '', /stream was silent/);
+  assert.equal(result.responseText, 'First step. Saved answer.');
+  assert.equal(saved.at(-1)?.content, result.responseText);
 });

@@ -13,6 +13,10 @@
   health PID, and fails visibly on duplicate instances or failed PM2 commands.
 - Dependencies are locked, the Feishu SDK is pinned to 1.74.0, and automated
   checks run on Windows and Ubuntu through GitHub Actions.
+- Codex terminal turn events finalize the bridge response immediately. A CLI
+  process that lingers after completion gets a two-second shutdown grace period
+  and bounded cleanup. Genuine stream timeouts retain partial text and usage.
+  See the [Codex JSON event format](https://learn.chatgpt.com/docs/non-interactive-mode#make-output-machine-readable).
 
 Verification on Windows, Node 24:
 
@@ -20,17 +24,21 @@ Verification on Windows, Node 24:
 | --- | --- |
 | Fresh `npm ci` without private config | Passed |
 | TypeScript + production build | Passed |
-| Unit and local HTTP regression tests | 93 passed |
+| Unit and local HTTP/process regression tests | 97 passed |
 | Isolated Windows watchdog scenarios | 9 passed |
 | Live Feishu initial connection | Passed |
 | Forced WebSocket disconnect | Recovered in about 12 seconds |
 | Half-open socket with suppressed incoming frames | Recovered in about 21 seconds |
 | Real scheduled watchdog with a stopped PM2 entry | Restored a new healthy process |
+| Terminal Codex success/failure with a CLI that never exits | Reply preserved; subprocess cleaned up |
+| Final JSON line without newline and genuine silent-turn timeout | Passed; partial text preserved |
+| Real Codex short request through configured proxy | Completed in about 18 seconds, no tool calls |
 | `npm audit` for the locked dependency tree | 0 known vulnerabilities at check time |
 
 No live Feishu messages were sent by these connectivity tests. The live tests
-cover Feishu transport; they do not establish model/proxy availability or a
-successful Codex model turn. Linux CI is configured but was not run locally.
+cover Feishu transport. A separate short Codex request verified one successful
+model turn through the configured proxy; it did not send a Feishu message.
+Windows and Ubuntu CI run without private credentials or real model calls.
 
 ## Remaining Windows setup
 

@@ -452,7 +452,7 @@ async function consumeStream(
             .join('\n\n')
             .trim();
       if (content && !forkSession) {
-        ctx.store.addMessage(sessionId, 'assistant', content);
+        ctx.store.addMessage(sessionId, 'assistant', content, tokenUsage ? JSON.stringify(tokenUsage) : null);
       }
     }
 
@@ -460,7 +460,12 @@ async function consumeStream(
       || e instanceof Error && e.name === 'AbortError';
 
     return {
-      responseText: '',
+      responseText: contentBlocks
+        .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text.trim())
+        .filter(Boolean)
+        .join('\n')
+        .trim(),
       tokenUsage,
       hasError: true,
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),

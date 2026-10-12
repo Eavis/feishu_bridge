@@ -297,7 +297,7 @@ export function mapCodexEvent(
 }
 
 function terminateChild(child: ChildProcessWithoutNullStreams): void {
-  if (child.exitCode !== null || child.pid === undefined) return;
+  const running = child.exitCode === null && child.signalCode === null && child.pid !== undefined;
   // Windows can lose the child `close` event after taskkill, while inherited
   // stdio handles keep this Node process alive. Release our handles eagerly;
   // taskkill continues independently in the background.
@@ -305,6 +305,9 @@ function terminateChild(child: ChildProcessWithoutNullStreams): void {
   child.stdout.destroy();
   child.stderr.destroy();
   child.unref();
+  // An exited parent can still have pipes held open by descendants. Release
+  // those handles, but never try to kill its potentially reused PID.
+  if (!running) return;
   if (process.platform === 'win32') {
     try {
       const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' });
@@ -331,6 +334,8 @@ export class CodexProvider {
     return new ReadableStream<string>({
       start(controller) {
         let finished = false;
+        let shutdownTimer: ReturnType<typeof setTimeout> | undefined;
+        const signal = params.abortController?.signal;
         const state: CodexState = {
           model: params.model || defaultModel,
           completed: false,
@@ -343,6 +348,7 @@ export class CodexProvider {
         const finish = () => {
           if (finished) return;
           finished = true;
+          signal?.removeEventListener('abort', abort);
           controller.close();
         };
         const { prompt, images } = buildPrompt(params);
@@ -377,9 +383,8 @@ export class CodexProvider {
           cwd: params.workingDirectory || process.cwd(), env: buildSubprocessEnv(resumeHome || stableHome),
           stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true,
         });
-        const abort = () => {
-          if (finished) return;
-          if (signal) signal.removeEventListener('abort', abort);
+        const stopChild = () => {
+          if (shutdownTimer) clearTimeout(shutdownTimer);
           // Detach provider listeners before destroying the pipes. Keeping a
           // `close` listener on a Windows child whose close notification was
           // lost can keep Node's test worker (and occasionally the daemon
@@ -390,26 +395,38 @@ export class CodexProvider {
           child.removeAllListeners('error');
           child.on('error', () => {});
           terminateChild(child);
+        };
+        const abort = () => {
+          if (finished) return;
+          stopChild();
           emit('error', 'Task stopped by user');
           // Never wait for Windows child-process `close`: it can be lost when
           // taskkill terminates a process tree. Closing now releases the bridge
           // session lock; terminateChild continues cleanup independently.
           finish();
         };
-        const signal = params.abortController?.signal;
-        if (signal) {
-          if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
-        }
-        child.stdin.end(prompt, 'utf8');
         child.stdout.setEncoding('utf8');
         child.stdout.on('data', (chunk: string) => {
           lineBuffer += chunk;
           let newline: number;
-          while ((newline = lineBuffer.indexOf('\n')) >= 0) {
+          while (!finished && (newline = lineBuffer.indexOf('\n')) >= 0) {
             const line = lineBuffer.slice(0, newline).trim();
             lineBuffer = lineBuffer.slice(newline + 1);
             if (!line) continue;
-            try { mapCodexEvent(JSON.parse(line), emit, state); } catch { /* tolerate future/malformed events */ }
+            try {
+              const event = JSON.parse(line);
+              mapCodexEvent(event, emit, state);
+              if (event.type === 'turn.completed' || event.type === 'turn.failed') {
+                // A terminal turn event completes the response even if CLI/MCP
+                // shutdown keeps the process or its inherited pipes open.
+                finish();
+                shutdownTimer = setTimeout(() => {
+                  console.warn('[codex-provider] CLI shutdown grace expired after terminal turn; cleaning up subprocess');
+                  stopChild();
+                }, 2000);
+                shutdownTimer.unref?.();
+              }
+            } catch { /* tolerate future/malformed events */ }
           }
         });
         child.stderr.setEncoding('utf8');
@@ -421,6 +438,7 @@ export class CodexProvider {
           finish();
         });
         child.on('close', code => {
+          if (shutdownTimer) clearTimeout(shutdownTimer);
           if (finished) return;
           if (signal) signal.removeEventListener('abort', abort);
           const tail = lineBuffer.trim();
@@ -429,6 +447,16 @@ export class CodexProvider {
           else if (!state.completed && !state.sawError) emit('error', `Codex exited with code ${code}${stderr.trim() ? `\n\nCodex stderr:\n${stderr.trim()}` : ''}`);
           finish();
         });
+        child.stdin.on('error', err => {
+          if (finished) return;
+          emit('error', `Codex input stream failed: ${err.message}`);
+          stopChild();
+          finish();
+        });
+        // Attach all process handlers before honoring an already-aborted turn.
+        if (signal?.aborted) { abort(); return; }
+        signal?.addEventListener('abort', abort, { once: true });
+        child.stdin.end(prompt, 'utf8');
       },
     });
   }
